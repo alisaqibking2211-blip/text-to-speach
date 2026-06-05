@@ -1,0 +1,1368 @@
+require "import"
+import "com.androlua.Http"
+import "cjson"
+import "com.androlua.LuaDialog"
+import "android.widget.*"
+import "android.view.*"
+import "android.content.Context"
+import "android.content.Intent"
+import "android.net.Uri"
+import "android.media.MediaPlayer"
+import "android.util.Base64"
+import "android.os.*"
+import "android.graphics.Typeface"
+import "java.io.*"
+import "android.speech.tts.TextToSpeech"
+import "android.provider.MediaStore"
+import "android.content.ContentValues"
+import "android.content.ContentResolver"
+
+-- Global Variables
+local context = activity or service
+local mainHandler = Handler(Looper.getMainLooper())
+local tts = nil
+local mainDialog = nil
+
+-- Set HTTP timeouts
+pcall(function()
+    Http.setConnTimeout(60000)
+    Http.setReadTimeout(60000)
+end)
+
+-- ========== EXTENDED VOICE LIST ==========
+local VOICE_LIST = {
+    "Puck", "Kore", "Charon", "Zephyr", "Fenrir", "Leda",
+    "Orus", "Aoede", "Callirrhoe", "Autonoe", "Enceladus", "Iapetus",
+    "Umbriel", "Algieba", "Despina", "Erinome", "Algenib", "Rasalgethi",
+    "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux", "Pulcherrima",
+    "Antares", "Atria", "Menkar", "Mimosa", "Mira", "Nashira",
+    "Syrma", "Tania", "Ruchbah", "Segin", "Avior", "Capella",
+    "Rigel", "Vega", "Sirius", "Altair", "Deneb", "Spica"
+}
+
+-- ========== EMOTIONS LIST (INCLUDING NEWS) ==========
+local EMOTION_LIST = {
+    "Neutral", "Happy", "Sad", "Angry", "Excited", "Fearful",
+    "Surprised", "Calm", "Serious", "Whisper", "Shouting",
+    "Melancholic", "Energetic", "Bored", "Confident", "Friendly",
+    "Formal", "Sarcastic", "Caring", "Hopeful", "News"
+}
+
+-- Emotion prefix mapping
+local EMOTION_PREFIX = {
+    Neutral = "",
+    Happy = "Speak this with a very happy and cheerful tone: ",
+    Sad = "Speak this with a sad and melancholic tone: ",
+    Angry = "Speak this with an angry and frustrated tone: ",
+    Excited = "Speak this with great excitement and enthusiasm: ",
+    Fearful = "Speak this with a fearful and nervous tone: ",
+    Surprised = "Speak this with a surprised and astonished tone: ",
+    Calm = "Speak this with a calm and peaceful voice: ",
+    Serious = "Speak this in a serious and formal manner: ",
+    Whisper = "Whisper this text softly: ",
+    Shouting = "Shout this text loudly: ",
+    Melancholic = "Speak this with a deeply melancholic tone: ",
+    Energetic = "Speak this with high energy and enthusiasm: ",
+    Bored = "Speak this in a bored and uninterested tone: ",
+    Confident = "Speak this with confidence and authority: ",
+    Friendly = "Speak this in a warm, friendly manner: ",
+    Formal = "Speak this in a very formal and professional way: ",
+    Sarcastic = "Speak this in a sarcastic and ironic tone: ",
+    Caring = "Speak this with a caring and gentle voice: ",
+    Hopeful = "Speak this with a hopeful and optimistic tone: ",
+    News = "Read this like a news anchor: "
+}
+
+-- Model list
+local MODELS = {"gemini-2.5-flash-preview-tts"}
+local CHUNK_SIZE = 5000
+
+-- Selected settings
+local selectedVoice = "Puck"
+local selectedModel = "gemini-2.5-flash-preview-tts"
+local selectedEmotion = "Neutral"
+local userText = ""
+local userFileName = ""
+local generatedAudioPath = nil
+local mediaPlayer = nil
+local isPlaying = false
+local googleApiKey = ""
+local hasGenerated = false
+
+-- Track active HTTP request
+local activeHttpRequest = nil
+local retryCount = 0
+local MAX_RETRY = 3
+
+-- Shared preferences name
+local PREFS_NAME = "Gemini_TTS_Pro"
+local prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+-- Initialize TTS
+function initTTS()
+    if tts == nil then
+        tts = TextToSpeech(context, TextToSpeech.OnInitListener({
+            onInit = function(status)
+                if status == TextToSpeech.SUCCESS then
+                    pcall(function()
+                        tts.setLanguage(java.util.Locale.US)
+                    end)
+                end
+            end
+        }))
+    end
+end
+
+-- Speak feedback
+function speakFeedback(message)
+    initTTS()
+    pcall(function()
+        if tts then
+            tts.speak(message, TextToSpeech.QUEUE_FLUSH, nil)
+        end
+    end)
+end
+
+-- Run on UI thread
+function runOnUi(callback)
+    mainHandler.post(Runnable({ run = callback }))
+end
+
+-- Delay execution
+function delay(ms, callback)
+    local handler = Handler(Looper.getMainLooper())
+    handler.postDelayed(Runnable({ run = callback }), ms)
+end
+
+-- Show toast message
+function showToast(msg)
+    runOnUi(function()
+        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+    end)
+end
+
+-- Vibrate
+function vibrate()
+    local vibrator = context.getSystemService(Context.VIBRATOR_SERVICE)
+    if vibrator then pcall(function() vibrator.vibrate(35) end) end
+end
+
+-- Save settings
+function saveSettings()
+    local editor = prefs.edit()
+    editor.putString("voice", selectedVoice)
+    editor.putString("model", selectedModel)
+    editor.putString("apikey", googleApiKey)
+    editor.putString("filename", userFileName)
+    editor.putString("emotion", selectedEmotion)
+    editor.apply()
+end
+
+-- Load settings
+function loadSettings()
+    selectedVoice = prefs.getString("voice", "Puck")
+    selectedModel = prefs.getString("model", "gemini-2.5-flash-preview-tts")
+    googleApiKey = prefs.getString("apikey", "")
+    userFileName = prefs.getString("filename", "")
+    selectedEmotion = prefs.getString("emotion", "Neutral")
+end
+
+-- Initialize media player
+function initMediaPlayer()
+    if mediaPlayer ~= nil then
+        if isPlaying then
+            pcall(function() mediaPlayer.stop() end)
+            isPlaying = false
+        end
+        pcall(function() mediaPlayer.release() end)
+    end
+    mediaPlayer = MediaPlayer()
+end
+
+-- Toggle play/pause
+function togglePlayPause(playBtn)
+    if mediaPlayer == nil then
+        showToast("No audio loaded")
+        return false
+    end
+    
+    if isPlaying then
+        pcall(function() mediaPlayer.pause() end)
+        isPlaying = false
+        runOnUi(function() playBtn.setText("PLAY") end)
+    else
+        pcall(function() 
+            mediaPlayer.start() 
+            isPlaying = true
+            runOnUi(function() playBtn.setText("PAUSE") end)
+        end)
+    end
+    return true
+end
+
+-- Stop audio
+function stopAudio(playBtn)
+    if mediaPlayer ~= nil and isPlaying then
+        pcall(function() 
+            mediaPlayer.stop()
+            isPlaying = false
+            runOnUi(function() 
+                if playBtn then playBtn.setText("PLAY") end
+                pcall(function() mediaPlayer.prepare() end)
+            end)
+        end)
+    end
+end
+
+-- Delete old audio file
+function deleteOldAudioFile()
+    if generatedAudioPath then
+        pcall(function()
+            local oldFile = File(generatedAudioPath)
+            if oldFile.exists() then
+                oldFile.delete()
+            end
+        end)
+        generatedAudioPath = nil
+    end
+end
+
+-- Write WAV header
+function writeWavHeader(outStream, totalAudioLen)
+    local sampleRate = 24000
+    local channels = 1
+    local bitsPerSample = 16
+    local byteRate = sampleRate * channels * (bitsPerSample / 8)
+    local blockAlign = channels * (bitsPerSample / 8)
+    
+    local totalDataLen = totalAudioLen
+    local totalSize = totalDataLen + 36
+    
+    local function getBytes(val)
+        return {
+            val & 0xff,
+            (val >> 8) & 0xff,
+            (val >> 16) & 0xff,
+            (val >> 24) & 0xff
+        }
+    end
+    
+    local totalSizeB = getBytes(totalSize)
+    local sampleRateB = getBytes(sampleRate)
+    local byteRateB = getBytes(byteRate)
+    local dataLenB = getBytes(totalDataLen)
+    
+    local header = {
+        0x52, 0x49, 0x46, 0x46,
+        totalSizeB[1], totalSizeB[2], totalSizeB[3], totalSizeB[4],
+        0x57, 0x41, 0x56, 0x45,
+        0x66, 0x6d, 0x74, 0x20,
+        0x10, 0x00, 0x00, 0x00,
+        0x01, 0x00,
+        channels & 0xff, (channels >> 8) & 0xff,
+        sampleRateB[1], sampleRateB[2], sampleRateB[3], sampleRateB[4],
+        byteRateB[1], byteRateB[2], byteRateB[3], byteRateB[4],
+        blockAlign & 0xff, (blockAlign >> 8) & 0xff,
+        bitsPerSample & 0xff, (bitsPerSample >> 8) & 0xff,
+        0x64, 0x61, 0x74, 0x61,
+        dataLenB[1], dataLenB[2], dataLenB[3], dataLenB[4]
+    }
+    
+    for i = 1, #header do
+        outStream.write(header[i])
+    end
+end
+
+-- Split text into chunks
+function splitTextIntoChunks(text)
+    local chunks = {}
+    local len = #text
+    for i = 1, len, CHUNK_SIZE do
+        local chunk = text:sub(i, math.min(i + CHUNK_SIZE - 1, len))
+        table.insert(chunks, chunk)
+    end
+    return chunks
+end
+
+-- Prepare text with emotion
+function prepareTextWithEmotion(originalText, emotion)
+    if emotion == "Neutral" or emotion == nil then
+        return originalText
+    end
+    local prefix = EMOTION_PREFIX[emotion] or ""
+    return prefix .. originalText
+end
+
+-- Generate audio for short text
+function generateSimpleAudio(text, voice, apikey, model, generateBtn, playBtn, resultLayout, emotion)
+    if activeHttpRequest ~= nil then
+        pcall(function()
+            if activeHttpRequest.cancel then
+                activeHttpRequest.cancel()
+            end
+        end)
+        activeHttpRequest = nil
+    end
+    
+    local finalText = prepareTextWithEmotion(text, emotion)
+    retryCount = 0
+    
+    local apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/" .. model .. ":generateContent?key=" .. apikey
+    
+    local requestBody = {
+        contents = {
+            {
+                parts = {
+                    { text = finalText }
+                }
+            }
+        },
+        generationConfig = {
+            responseModalities = {"AUDIO"},
+            speechConfig = {
+                voiceConfig = {
+                    prebuiltVoiceConfig = { voiceName = voice }
+                }
+            }
+        }
+    }
+    
+    local headers = HashMap()
+    headers.put("Content-Type", "application/json")
+    
+    local function makeRequest()
+        activeHttpRequest = Http.post(apiUrl, cjson.encode(requestBody), headers, function(code, content)
+            activeHttpRequest = nil
+            
+            if code == 200 then
+                local ok, data = pcall(cjson.decode, content)
+                if ok and data.candidates and #data.candidates > 0 then
+                    local candidate = data.candidates[1]
+                    local base64Audio = nil
+                    
+                    if candidate.content and candidate.content.parts then
+                        for i = 1, #candidate.content.parts do
+                            if candidate.content.parts[i].inlineData then
+                                base64Audio = candidate.content.parts[i].inlineData.data
+                                break
+                            end
+                        end
+                    end
+                    
+                    if base64Audio then
+                        local audioBytes = Base64.decode(base64Audio, Base64.NO_WRAP)
+                        local tempPath = context.getCacheDir().getPath() .. "/tts_" .. os.time() .. ".wav"
+                        local file = File(tempPath)
+                        local fos = FileOutputStream(file)
+                        writeWavHeader(fos, #audioBytes)
+                        fos.write(audioBytes)
+                        fos.close()
+                        generatedAudioPath = tempPath
+                        
+                        runOnUi(function()
+                            resultLayout.setVisibility(View.VISIBLE)
+                            initMediaPlayer()
+                            mediaPlayer.setDataSource(generatedAudioPath)
+                            mediaPlayer.prepare()
+                            playBtn.setEnabled(true)
+                            generateBtn.setEnabled(true)
+                            generateBtn.setText("REGENERATE")
+                            showToast("Audio generated successfully!")
+                            speakFeedback("Audio ready")
+                        end)
+                        return
+                    end
+                end
+                runOnUi(function()
+                    generateBtn.setEnabled(true)
+                    generateBtn.setText("GENERATE")
+                    showToast("Failed to parse response")
+                end)
+            elseif code == 429 then
+                retryCount = retryCount + 1
+                if retryCount <= MAX_RETRY then
+                    showToast("Rate limited! Retrying in 5 sec " .. retryCount .. "/" .. MAX_RETRY)
+                    delay(5000, function()
+                        makeRequest()
+                    end)
+                else
+                    runOnUi(function()
+                        generateBtn.setEnabled(true)
+                        generateBtn.setText("GENERATE")
+                        showToast("Too many requests, try later")
+                    end)
+                end
+            elseif code == 403 then
+                runOnUi(function()
+                    generateBtn.setEnabled(true)
+                    generateBtn.setText("GENERATE")
+                    showToast("Invalid API key, check settings")
+                end)
+            else
+                runOnUi(function()
+                    generateBtn.setEnabled(true)
+                    generateBtn.setText("GENERATE")
+                    showToast("HTTP error: " .. code)
+                end)
+            end
+        end)
+    end
+    
+    makeRequest()
+end
+
+-- Generate audio for long text with chunking (with emotion)
+function generateLongAudio(text, voice, apikey, model, generateBtn, playBtn, resultLayout, emotion)
+    if activeHttpRequest ~= nil then
+        pcall(function()
+            if activeHttpRequest.cancel then
+                activeHttpRequest.cancel()
+            end
+        end)
+        activeHttpRequest = nil
+    end
+    
+    local finalText = prepareTextWithEmotion(text, emotion)
+    local chunks = splitTextIntoChunks(finalText)
+    local totalChunks = #chunks
+    local allAudioData = {}
+    local completedChunks = 0
+    local hasError = false
+    
+    local function processChunk(index)
+        if hasError then
+            runOnUi(function()
+                generateBtn.setEnabled(true)
+                generateBtn.setText("GENERATE")
+            end)
+            return
+        end
+        
+        if index > totalChunks then
+            if #allAudioData == 0 then
+                runOnUi(function()
+                    generateBtn.setEnabled(true)
+                    generateBtn.setText("GENERATE")
+                    showToast("No audio data received")
+                end)
+                return
+            end
+            
+            local totalLen = 0
+            for i = 1, #allAudioData do
+                totalLen = totalLen + #allAudioData[i]
+            end
+            
+            deleteOldAudioFile()
+            local tempPath = context.getCacheDir().getPath() .. "/tts_" .. os.time() .. ".wav"
+            local file = File(tempPath)
+            local fos = FileOutputStream(file)
+            writeWavHeader(fos, totalLen)
+            
+            for i = 1, #allAudioData do
+                fos.write(allAudioData[i])
+            end
+            
+            fos.close()
+            generatedAudioPath = tempPath
+            
+            runOnUi(function()
+                resultLayout.setVisibility(View.VISIBLE)
+                initMediaPlayer()
+                mediaPlayer.setDataSource(generatedAudioPath)
+                mediaPlayer.prepare()
+                playBtn.setEnabled(true)
+                generateBtn.setEnabled(true)
+                generateBtn.setText("REGENERATE")
+                showToast("Audio created from " .. totalChunks .. " chunks!")
+            end)
+            return
+        end
+        
+        local apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/" .. model .. ":generateContent?key=" .. apikey
+        local requestBody = {
+            contents = {
+                {
+                    parts = {
+                        { text = chunks[index] }
+                    }
+                }
+            },
+            generationConfig = {
+                responseModalities = {"AUDIO"},
+                speechConfig = {
+                    voiceConfig = {
+                        prebuiltVoiceConfig = { voiceName = voice }
+                    }
+                }
+            }
+        }
+        local headers = HashMap()
+        headers.put("Content-Type", "application/json")
+        
+        activeHttpRequest = Http.post(apiUrl, cjson.encode(requestBody), headers, function(code, content)
+            activeHttpRequest = nil
+            
+            if code == 200 then
+                local ok, data = pcall(cjson.decode, content)
+                if ok and data.candidates and #data.candidates > 0 then
+                    local candidate = data.candidates[1]
+                    local base64Audio = nil
+                    if candidate.content and candidate.content.parts then
+                        for i = 1, #candidate.content.parts do
+                            if candidate.content.parts[i].inlineData then
+                                base64Audio = candidate.content.parts[i].inlineData.data
+                                break
+                            end
+                        end
+                    end
+                    if base64Audio then
+                        table.insert(allAudioData, Base64.decode(base64Audio, Base64.NO_WRAP))
+                        completedChunks = completedChunks + 1
+                        runOnUi(function()
+                            showToast("Chunk " .. index .. "/" .. totalChunks .. " complete")
+                        end)
+                        delay(1000, function()
+                            processChunk(index + 1)
+                        end)
+                    else
+                        hasError = true
+                        runOnUi(function()
+                            generateBtn.setEnabled(true)
+                            generateBtn.setText("GENERATE")
+                            showToast("No audio found in chunk " .. index)
+                        end)
+                    end
+                else
+                    hasError = true
+                    runOnUi(function()
+                        generateBtn.setEnabled(true)
+                        generateBtn.setText("GENERATE")
+                        showToast("Parse error in chunk " .. index)
+                    end)
+                end
+            elseif code == 429 then
+                showToast("Rate limited! Waiting 5 seconds...")
+                delay(5000, function()
+                    processChunk(index)
+                end)
+            else
+                hasError = true
+                runOnUi(function()
+                    generateBtn.setEnabled(true)
+                    generateBtn.setText("GENERATE")
+                    showToast("HTTP error: " .. code)
+                end)
+            end
+        end)
+    end
+    
+    processChunk(1)
+end
+
+-- ========== IMPROVED DOWNLOAD FUNCTION ==========
+function downloadAudioToInternalStorage()
+    if not generatedAudioPath then
+        showToast("Generate audio first")
+        speakFeedback("No file to download")
+        return false
+    end
+    
+    local sourceFile = File(generatedAudioPath)
+    if not sourceFile.exists() then
+        showToast("Audio file not found")
+        return false
+    end
+    
+    local fileName = (userFileName ~= "" and userFileName or "voice_" .. os.time()) .. ".wav"
+    local success = false
+    
+    if Build.VERSION.SDK_INT >= 29 then
+        pcall(function()
+            local resolver = context.getContentResolver()
+            local contentValues = ContentValues()
+            contentValues.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+            contentValues.put(MediaStore.MediaColumns.MIME_TYPE, "audio/wav")
+            contentValues.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            
+            local uri = resolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
+            if uri then
+                local os = resolver.openOutputStream(uri)
+                local input = FileInputStream(sourceFile)
+                local buffer = luajava.createArray("byte", 8192)
+                local len
+                while true do
+                    len = input.read(buffer)
+                    if len == -1 then break end
+                    os.write(buffer, 0, len)
+                end
+                os.close()
+                input.close()
+                success = true
+                showToast("Saved to Downloads: " .. fileName)
+                speakFeedback("Download successful")
+            else
+                showToast("Failed to create file via MediaStore")
+            end
+        end)
+    else
+        pcall(function()
+            local downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if not downloadDir.exists() then
+                downloadDir.mkdirs()
+            end
+            local destFile = File(downloadDir, fileName)
+            local input = FileInputStream(sourceFile)
+            local output = FileOutputStream(destFile)
+            local buffer = luajava.createArray("byte", 8192)
+            local len
+            while true do
+                len = input.read(buffer)
+                if len == -1 then break end
+                output.write(buffer, 0, len)
+            end
+            output.close()
+            input.close()
+            success = true
+            showToast("Saved: " .. destFile.getAbsolutePath())
+            speakFeedback("Download successful")
+            local intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
+            intent.setData(Uri.fromFile(destFile))
+            context.sendBroadcast(intent)
+        end)
+    end
+    
+    if not success then
+        showToast("Download failed. Check permissions.")
+    end
+    return success
+end
+
+-- ========== NEW SHARE FUNCTION ==========
+function shareAudioFile()
+    if not generatedAudioPath then
+        showToast("Generate audio first")
+        speakFeedback("Nothing to share")
+        return
+    end
+    
+    local sourceFile = File(generatedAudioPath)
+    if not sourceFile.exists() then
+        showToast("Audio file not found")
+        return
+    end
+    
+    pcall(function()
+        local fileName = (userFileName ~= "" and userFileName or "voice_" .. os.time()) .. ".wav"
+        local shareIntent = Intent(Intent.ACTION_SEND)
+        shareIntent.setType("audio/wav")
+        shareIntent.putExtra(Intent.EXTRA_STREAM, Uri.fromFile(sourceFile))
+        shareIntent.putExtra(Intent.EXTRA_SUBJECT, "Shared Audio")
+        shareIntent.putExtra(Intent.EXTRA_TEXT, "Check out this audio generated by Gemini TTS")
+        shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        context.startActivity(Intent.createChooser(shareIntent, "Share Audio via"))
+        speakFeedback("Sharing")
+    end)
+end
+
+-- API key settings dialog
+function showApiSettings()
+    local views = {}
+    
+    local layout = {
+        LinearLayout,
+        orientation = "vertical",
+        padding = "24dp",
+        layout_width = "fill",
+        layout_height = "wrap",
+        {
+            TextView,
+            text = "API CONFIGURATION",
+            textSize = 18,
+            textColor = "#2196F3",
+            gravity = "center",
+            paddingBottom = "20dp",
+            typeface = Typeface.DEFAULT_BOLD
+        },
+        {
+            TextView,
+            text = "Google API Key:",
+            textSize = 14,
+            textColor = "#333333",
+            paddingBottom = "8dp"
+        },
+        {
+            EditText,
+            id = "apiInput",
+            hint = "Enter your Google Gemini API key",
+            layout_width = "fill",
+            layout_height = "wrap",
+            backgroundColor = "#F5F5F5",
+            padding = "12dp"
+        },
+        {
+            TextView,
+            text = "Get API key from: console.cloud.google.com",
+            textSize = 11,
+            textColor = "#2196F3",
+            paddingTop = "8dp",
+            paddingBottom = "16dp"
+        },
+        {
+            LinearLayout,
+            orientation = "horizontal",
+            layout_width = "fill",
+            layout_height = "wrap",
+            layout_marginTop = "10dp",
+            {
+                Button,
+                id = "testBtn",
+                text = "TEST",
+                layout_width = "0dp",
+                layout_weight = "1",
+                backgroundColor = "#FF9800",
+                textColor = "#FFFFFF",
+                padding = "12dp",
+                layout_marginRight = "5dp"
+            },
+            {
+                Button,
+                id = "saveBtn",
+                text = "SAVE",
+                layout_width = "0dp",
+                layout_weight = "1",
+                backgroundColor = "#4CAF50",
+                textColor = "#FFFFFF",
+                padding = "12dp",
+                layout_marginLeft = "5dp"
+            },
+            {
+                Button,
+                id = "closeBtn",
+                text = "CLOSE",
+                layout_width = "0dp",
+                layout_weight = "1",
+                backgroundColor = "#9E9E9E",
+                textColor = "#FFFFFF",
+                padding = "12dp",
+                layout_marginLeft = "5dp"
+            }
+        }
+    }
+    
+    local dlg = LuaDialog(context)
+    dlg.setTitle("API Settings")
+    dlg.setView(loadlayout(layout, views))
+    dlg.setCancelable(true)
+    
+    views.apiInput.setText(googleApiKey)
+    
+    views.testBtn.onClick = function()
+        local key = views.apiInput.getText().toString()
+        if key == "" then
+            showToast("Enter API key first")
+            return
+        end
+        views.testBtn.setText("Testing...")
+        views.testBtn.setEnabled(false)
+        local testUrl = "https://generativelanguage.googleapis.com/v1beta/models?key=" .. key
+        Http.get(testUrl, nil, function(code, content)
+            runOnUi(function()
+                views.testBtn.setText("TEST")
+                views.testBtn.setEnabled(true)
+                if code == 200 then
+                    showToast("API key is valid!")
+                else
+                    showToast("Invalid API key. Error: " .. code)
+                end
+            end)
+        end)
+    end
+    
+    views.saveBtn.onClick = function()
+        local apikey = views.apiInput.getText().toString()
+        if apikey == "" then
+            showToast("Please enter API key")
+            return
+        end
+        googleApiKey = apikey
+        saveSettings()
+        showToast("Settings saved")
+        dlg.dismiss()
+    end
+    
+    views.closeBtn.onClick = function()
+        dlg.dismiss()
+    end
+    
+    dlg.show()
+end
+
+-- About and support dialog
+function aboutAndSupport()
+    vibrate()
+    local help_views = {}
+    local help_layout = {
+        LinearLayout;
+        orientation = "vertical";
+        padding = "16dp";
+        layout_width = "fill";
+        layout_height = "wrap";
+        {
+            TextView;
+            text = "Gemini Text to Speech";
+            textSize = 18;
+            textColor = "#2E7D32";
+            gravity = "center";
+            typeface = Typeface.DEFAULT_BOLD;
+            paddingBottom = "8dp";
+        };
+        {
+            TextView;
+            text = "Developed by Bridge Tech";
+            textSize = 14;
+            textColor = "#666666";
+            gravity = "center";
+            paddingBottom = "5dp";
+        };
+        {
+            TextView;
+            text = "Created by CH abdulrafay";
+            textSize = 14;
+            textColor = "#888888";
+            gravity = "center";
+            paddingBottom = "20dp";
+        };
+        {
+            TextView;
+            text = "Convert any text into natural speech using Google Gemini AI.\nSupports " .. #VOICE_LIST .. " premium voices, " .. #EMOTION_LIST .. " emotions (including News!), long text chunking, and saves audio as WAV file.";
+            textSize = 13;
+            textColor = "#333333";
+            gravity = "center";
+            paddingBottom = "20dp";
+            paddingLeft = "10dp";
+            paddingRight = "10dp";
+            typeface = Typeface.DEFAULT;
+        };
+        {
+            TextView;
+            text = "Contact Us";
+            textSize = 16;
+            textColor = "#000000";
+            gravity = "center";
+            paddingBottom = "10dp";
+        };
+        {
+            ScrollView;
+            layout_width = "fill";
+            layout_height = "wrap_content";
+            {
+                LinearLayout;
+                orientation = "vertical";
+                layout_width = "fill";
+                layout_height = "wrap_content";
+                gravity = "center";
+                layout_marginTop = "5dp";
+                {
+                    Button;
+                    id = "whatsappChannelBtn";
+                    text = "WhatsApp Channel";
+                    layout_width = "fill";
+                    layout_height = "wrap_content";
+                    layout_margin = "2dp";
+                    textSize = "12sp";
+                    padding = "8dp";
+                    backgroundColor = "#25D366";
+                    textColor = "#FFFFFF";
+                };
+                {
+                    Button;
+                    id = "whatsappCommunityBtn";
+                    text = "WhatsApp Community";
+                    layout_width = "fill";
+                    layout_height = "wrap_content";
+                    layout_margin = "2dp";
+                    textSize = "12sp";
+                    padding = "8dp";
+                    backgroundColor = "#25D366";
+                    textColor = "#FFFFFF";
+                };
+                {
+                    Button;
+                    id = "gamingCommunityBtn";
+                    text = "Gaming Club Community";
+                    layout_width = "fill";
+                    layout_height = "wrap_content";
+                    layout_margin = "2dp";
+                    textSize = "12sp";
+                    padding = "8dp";
+                    backgroundColor = "#9C27B0";
+                    textColor = "#FFFFFF";
+                };
+                {
+                    Button;
+                    id = "youtubeBtn";
+                    text = "YouTube Channel";
+                    layout_width = "fill";
+                    layout_height = "wrap_content";
+                    layout_margin = "2dp";
+                    textSize = "12sp";
+                    padding = "8dp";
+                    backgroundColor = "#FF0000";
+                    textColor = "#FFFFFF";
+                };
+                {
+                    Button;
+                    id = "feedbackBtn";
+                    text = "Send Feedback by Developer";
+                    layout_width = "fill";
+                    layout_height = "wrap_content";
+                    layout_margin = "2dp";
+                    textSize = "12sp";
+                    padding = "8dp";
+                    backgroundColor = "#FF9800";
+                    textColor = "#FFFFFF";
+                };
+                {
+                    Button;
+                    id = "goBackButton";
+                    text = "GO BACK";
+                    layout_width = "fill";
+                    layout_height = "wrap_content";
+                    layout_margin = "2dp";
+                    textSize = "12sp";
+                    padding = "8dp";
+                    backgroundColor = "#9E9E9E";
+                    textColor = "#FFFFFF";
+                };
+            };
+        };
+    }
+    local help_dialog = LuaDialog(context)
+    help_dialog.setTitle("About")
+    help_dialog.setView(loadlayout(help_layout, help_views))
+    help_dialog.setCancelable(true)
+    
+    help_views.whatsappChannelBtn.onClick = function()
+        if mainDialog then mainDialog.dismiss() end
+        help_dialog.dismiss()
+        pcall(function()
+            local url = "https://whatsapp.com/channel/0029VbCJfWSAojYuaMuB9E1t"
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            context.startActivity(intent)
+        end)
+    end
+    
+    help_views.whatsappCommunityBtn.onClick = function()
+        if mainDialog then mainDialog.dismiss() end
+        help_dialog.dismiss()
+        pcall(function()
+            local url = "https://chat.whatsapp.com/C5jA2u0gGDO9rkgcCY2ybg"
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            context.startActivity(intent)
+        end)
+    end
+    
+    help_views.gamingCommunityBtn.onClick = function()
+        if mainDialog then mainDialog.dismiss() end
+        help_dialog.dismiss()
+        pcall(function()
+            local url = "https://chat.whatsapp.com/Fsxp8fw3iM0KbzTPee9yRb"
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            context.startActivity(intent)
+        end)
+    end
+    
+    help_views.youtubeBtn.onClick = function()
+        if mainDialog then mainDialog.dismiss() end
+        help_dialog.dismiss()
+        pcall(function()
+            local url = "https://youtube.com/@csr-official-f5v?si=nwBIaiiFoI8Ix8k5"
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            context.startActivity(intent)
+        end)
+    end
+    
+    help_views.feedbackBtn.onClick = function()
+        if mainDialog then mainDialog.dismiss() end
+        help_dialog.dismiss()
+        pcall(function()
+            local number = "923057040811"
+            local message = "Assalam%20o%20Alaikum.%20I%20want%20to%20give%20feedback%20about%20your%20Gemini%20TTS%20plugin."
+            local url = "https://wa.me/" .. number .. "?text=" .. message
+            local intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+            context.startActivity(intent)
+        end)
+    end
+    
+    help_views.goBackButton.onClick = function()
+        help_dialog.dismiss()
+    end
+    
+    help_dialog.setOnCancelListener{
+        onCancel = function()
+            help_dialog.dismiss()
+        end
+    }
+    help_dialog.show()
+end
+
+-- Main dialog (main interface) with Emotions, Share button, and more voices
+function showMain()
+    loadSettings()
+    initMediaPlayer()
+    initTTS()
+    hasGenerated = false
+    
+    local views = {}
+    
+    local scrollLayout = {
+        ScrollView,
+        layout_width = "fill",
+        layout_height = "fill",
+        {
+            LinearLayout,
+            orientation = "vertical",
+            padding = "30dp",
+            layout_width = "fill",
+            layout_height = "wrap",
+            {
+                TextView,
+                text = "Google Gemini Text to Speech",
+                textSize = 20,
+                textColor = "#2E7D32",
+                gravity = "center",
+                paddingBottom = "8dp",
+                typeface = Typeface.DEFAULT_BOLD
+            },
+            {
+                TextView,
+                text = "Developed by Bridge Tech",
+                textSize = 14,
+                textColor = "#666666",
+                gravity = "center",
+                paddingBottom = "25dp"
+            },
+            {
+                EditText,
+                id = "textInput",
+                hint = "Type your text here...",
+                layout_width = "fill",
+                layout_height = "150dp",
+                backgroundColor = "#F5F5F5",
+                padding = "15dp",
+                gravity = Gravity.TOP,
+                textSize = 14,
+                layout_marginBottom = "15dp"
+            },
+            {
+                TextView,
+                text = "Select Voice:",
+                textSize = 14,
+                textColor = "#333333",
+                paddingBottom = "5dp"
+            },
+            {
+                Spinner,
+                id = "voiceSpin",
+                layout_width = "fill",
+                layout_height = "wrap",
+                backgroundColor = "#F5F5F5",
+                layout_marginBottom = "15dp"
+            },
+            {
+                TextView,
+                text = "Select Emotion:",
+                textSize = 14,
+                textColor = "#333333",
+                paddingBottom = "5dp"
+            },
+            {
+                Spinner,
+                id = "emotionSpin",
+                layout_width = "fill",
+                layout_height = "wrap",
+                backgroundColor = "#F5F5F5",
+                layout_marginBottom = "15dp"
+            },
+            {
+                EditText,
+                id = "fileNameInput",
+                hint = "File name (without extension)",
+                layout_width = "fill",
+                layout_height = "wrap",
+                backgroundColor = "#F5F5F5",
+                padding = "12dp",
+                layout_marginBottom = "15dp"
+            },
+            {
+                Button,
+                id = "generateBtn",
+                text = "GENERATE",
+                layout_width = "fill",
+                layout_height = "wrap",
+                backgroundColor = "#2196F3",
+                textColor = "#FFFFFF",
+                padding = "16dp",
+                textSize = 16,
+                layout_marginBottom = "15dp"
+            },
+            {
+                LinearLayout,
+                id = "resultLayout",
+                orientation = "horizontal",
+                layout_width = "fill",
+                layout_height = "wrap",
+                visibility = View.GONE,
+                layout_marginBottom = "15dp",
+                {
+                    Button,
+                    id = "playBtn",
+                    text = "PLAY",
+                    layout_width = "0dp",
+                    layout_weight = "1",
+                    backgroundColor = "#4CAF50",
+                    textColor = "#FFFFFF",
+                    padding = "12dp",
+                    layout_marginRight = "5dp",
+                    enabled = false
+                },
+                {
+                    Button,
+                    id = "downloadBtn",
+                    text = "DOWNLOAD",
+                    layout_width = "0dp",
+                    layout_weight = "1",
+                    backgroundColor = "#FF9800",
+                    textColor = "#FFFFFF",
+                    padding = "12dp",
+                    layout_marginLeft = "5dp",
+                    layout_marginRight = "5dp"
+                },
+                {
+                    Button,
+                    id = "shareBtn",
+                    text = "SHARE",
+                    layout_width = "0dp",
+                    layout_weight = "1",
+                    backgroundColor = "#673AB7",
+                    textColor = "#FFFFFF",
+                    padding = "12dp",
+                    layout_marginLeft = "5dp"
+                }
+            },
+            {
+                LinearLayout,
+                orientation = "horizontal",
+                layout_width = "fill",
+                layout_height = "wrap",
+                {
+                    Button,
+                    id = "apiBtn",
+                    text = "API Setting",
+                    layout_width = "0dp",
+                    layout_weight = "1",
+                    backgroundColor = "#9C27B0",
+                    textColor = "#FFFFFF",
+                    padding = "12dp",
+                    layout_marginRight = "5dp"
+                },
+                {
+                    Button,
+                    id = "aboutBtn",
+                    text = "ABOUT & SUPPORT",
+                    layout_width = "0dp",
+                    layout_weight = "1",
+                    backgroundColor = "#607D8B",
+                    textColor = "#FFFFFF",
+                    padding = "12dp",
+                    layout_marginLeft = "5dp",
+                    layout_marginRight = "5dp"
+                },
+                {
+                    Button,
+                    id = "exitBtn",
+                    text = "EXIT",
+                    layout_width = "0dp",
+                    layout_weight = "1",
+                    backgroundColor = "#D32F2F",
+                    textColor = "#FFFFFF",
+                    padding = "12dp",
+                    layout_marginLeft = "5dp"
+                }
+            }
+        }
+    }
+    
+    local dlg = LuaDialog(context)
+    dlg.setTitle("Google Gemini TTS Pro")
+    dlg.setCancelable(false)
+    dlg.setView(loadlayout(scrollLayout, views))
+    mainDialog = dlg
+    
+    views.textInput.setText("")
+    views.fileNameInput.setText(userFileName)
+    
+    views.textInput.addTextChangedListener({
+        afterTextChanged = function(editable)
+            userText = editable.toString()
+        end
+    })
+    
+    views.fileNameInput.addTextChangedListener({
+        afterTextChanged = function(editable)
+            userFileName = editable.toString()
+            saveSettings()
+        end
+    })
+    
+    -- Voice Spinner
+    local voiceAdapter = ArrayAdapter(context, android.R.layout.simple_spinner_item, VOICE_LIST)
+    voiceAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+    views.voiceSpin.setAdapter(voiceAdapter)
+    
+    for i, v in ipairs(VOICE_LIST) do
+        if v == selectedVoice then
+            views.voiceSpin.setSelection(i - 1)
+            break
+        end
+    end
+    
+    views.voiceSpin.onItemSelectedListener = {
+        onItemSelected = function(p, v, pos)
+            selectedVoice = VOICE_LIST[pos + 1]
+            saveSettings()
+        end
+    }
+    
+    -- Emotion Spinner
+    local emotionAdapter = ArrayAdapter(context, android.R.layout.simple_spinner_item, EMOTION_LIST)
+    emotionAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+    views.emotionSpin.setAdapter(emotionAdapter)
+    
+    for i, e in ipairs(EMOTION_LIST) do
+        if e == selectedEmotion then
+            views.emotionSpin.setSelection(i - 1)
+            break
+        end
+    end
+    
+    views.emotionSpin.onItemSelectedListener = {
+        onItemSelected = function(p, v, pos)
+            selectedEmotion = EMOTION_LIST[pos + 1]
+            saveSettings()
+        end
+    }
+    
+    views.playBtn.onClick = function()
+        if not generatedAudioPath then
+            showToast("Generate audio first")
+            return
+        end
+        if mediaPlayer == nil then
+            initMediaPlayer()
+            pcall(function()
+                mediaPlayer.setDataSource(generatedAudioPath)
+                mediaPlayer.prepare()
+            end)
+        end
+        togglePlayPause(views.playBtn)
+    end
+    
+    views.downloadBtn.onClick = function()
+        vibrate()
+        downloadAudioToInternalStorage()
+    end
+    
+    views.shareBtn.onClick = function()
+        vibrate()
+        shareAudioFile()
+    end
+    
+    views.generateBtn.onClick = function()
+        local currentText = views.textInput.getText().toString()
+        if currentText == "" then
+            showToast("Please enter text!")
+            vibrate()
+            return
+        end
+        
+        if googleApiKey == "" then
+            showToast("Please set API key in settings!")
+            showApiSettings()
+            return
+        end
+        
+        userText = currentText
+        
+        if mediaPlayer ~= nil then
+            if isPlaying then
+                pcall(function() mediaPlayer.stop() end)
+                isPlaying = false
+            end
+            pcall(function() mediaPlayer.release() end)
+            mediaPlayer = nil
+        end
+        
+        deleteOldAudioFile()
+        
+        views.playBtn.setEnabled(false)
+        views.playBtn.setText("PLAY")
+        views.resultLayout.setVisibility(View.GONE)
+        isPlaying = false
+        hasGenerated = false
+        
+        views.generateBtn.setEnabled(false)
+        views.generateBtn.setText("GENERATING...")
+        views.generateBtn.setBackgroundColor(0xFF9E9E9E)
+        
+        local textLength = #userText
+        
+        if textLength <= CHUNK_SIZE then
+            generateSimpleAudio(userText, selectedVoice, googleApiKey, selectedModel, views.generateBtn, views.playBtn, views.resultLayout, selectedEmotion)
+        else
+            generateLongAudio(userText, selectedVoice, googleApiKey, selectedModel, views.generateBtn, views.playBtn, views.resultLayout, selectedEmotion)
+        end
+    end
+    
+    views.apiBtn.onClick = function()
+        showApiSettings()
+        vibrate()
+    end
+    
+    views.aboutBtn.onClick = function()
+        aboutAndSupport()
+    end
+    
+    views.exitBtn.onClick = function()
+        if activeHttpRequest ~= nil then
+            pcall(function()
+                if activeHttpRequest.cancel then
+                    activeHttpRequest.cancel()
+                end
+            end)
+            activeHttpRequest = nil
+        end
+        if mediaPlayer ~= nil then
+            pcall(function() mediaPlayer.release() end)
+            mediaPlayer = nil
+        end
+        deleteOldAudioFile()
+        if tts then
+            pcall(function() tts.stop() end)
+            pcall(function() tts.shutdown() end)
+        end
+        dlg.dismiss()
+    end
+    
+    dlg.show()
+end
+
+-- Program entry point
+loadSettings()
+if googleApiKey == "" then
+    showToast("Please configure API key first")
+    showApiSettings()
+else
+    showMain()
+end
